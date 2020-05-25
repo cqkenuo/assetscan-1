@@ -1,6 +1,8 @@
 # -*- coding:utf-8 -*-
 import md5
 import threading
+from Queue import Queue
+
 from common.logger.log_util import LogUtil as logging
 logger = logging.getLogger(__name__)
 mu = threading.Lock()
@@ -34,7 +36,7 @@ class ReportManage(object):
         rpt = ReportManage()
         rpt._results = []
         rpt._unique_hash = []
-        rpt._output_queue = []
+        rpt._output_queue = Queue()
         return rpt
 
 
@@ -133,7 +135,7 @@ class IPlugin(object):
             if not unique_hash in self.result_manage.unique_hash:
                 self.result_manage.unique_hash.append(unique_hash)
                 self.result_manage.results.append(filters)
-                self.result_manage.output_queue.append(package)
+                self.result_manage.output_queue.put(package)
             mu.release()
 
     def _run(self, *args,**kwargs):
@@ -151,6 +153,7 @@ class IPlugin(object):
             t = threading.Thread(target=self._store)
             t.start()
             self._run(*args,**kwargs)
+            self._create_report()
         except:
             import traceback
             msg = traceback.format_exc()
