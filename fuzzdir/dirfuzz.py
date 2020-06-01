@@ -1,5 +1,6 @@
 # -*- coding:utf-8 -*-
 import base64
+import cgi
 import os
 import random
 import sys
@@ -10,7 +11,7 @@ from thirdparty.connection.http_urllib3 import HttpUtil
 
 from TaskCenter import TaskStatus, TaskCenter
 from common.initsql import SQL3
-from common.utils import char_convert
+from common.utils import char_convert, get_banner_by_content
 from pool.thread_pool import ThreadPool
 from ProbeTool import HttpWeb
 from common.db.sqlite3_db import sqlite3_db
@@ -21,11 +22,10 @@ mu = threading.Lock()
 
 class DirFuzz(object):
 
-    def __init__(self,taskid=None,assetid=None,dbname=None,url=None,statusqueue=None):
+    def __init__(self,dbname=None,url=None,statusqueue=None):
         self.dbname = dbname
-        self.taskid = taskid
-        self.assetid = assetid
         self.filename = []
+        self.taskid = None
         self.fuzzdb = None
         self.url = url
         self.statusqueue = statusqueue
@@ -54,7 +54,7 @@ class DirFuzz(object):
         with open(filename,"rb+") as file:
             self.filename = [x.strip() for x in file.readlines()]
 
-    def cache_content(self,url):
+    def cache_content(self,taskid,assetid,url):
         try:
             filename = "".join(random.sample('abcdefghijklmnopqrstuvwxyz0123456789', 6)) + ".css"
             dirname = "".join(random.sample('abcdefghijklmnopqrstuvwxyz0123456789', 6)) + "/"
@@ -62,33 +62,34 @@ class DirFuzz(object):
             res2 = self.httpclient.request(urljoin(url, dirname), timeout=3,redirect=True)
             res3 = self.httpclient.request(url,timeout=3,redirect=True)
             content = res3.content
-            rs_one = {"taskid": self.taskid, "assetid": self.assetid, "url": url,"banner": base64.b64encode(content[0:100]), "reslength": len(content), "status": 1}
+            rs_one = {"taskid": taskid, "assetid": assetid, "url": url,"banner": base64.b64encode(content[0:100]), "reslength": len(content), "status": 1}
             self.fuzzdb.insert('fuzztask', rs_one, filter=False)
             rs = [res1.content,res2.content,res3.content]
         except:
             rs = None
         return rs
 
-    def req_ad_file(self,url,filename,cache):
+    def req_ad_file(self,taskid,assetid,url,filename,cache):
         newurl = urljoin(url,filename)
         try:
             res = self.httpclient.request(newurl,timeout=3,redirect=True)
             condition1 = (abs(len(res.content)-len(cache[0])) <=20) or (abs(len(res.content)-len(cache[1])) <= 20) or (abs(len(res.content.replace(filename,"").replace(newurl,""))-len(cache[2].replace(filename,"").replace(newurl,""))) <= 20)
-            condition2 = (res.status_code !=405) and ((res.status_code >= 400 and res.status_code < 500) or (res.status_code > 500) or (res.status_code < 200))
+            condition2 = (res.status_code not in [401,405]) and ((res.status_code >= 400 and res.status_code < 500) or (res.status_code > 500) or (res.status_code < 200))
             if condition2:
                 pass
             else:
                 if not condition1:
                     if mu.acquire():
-                        content = res.content
-                        rs_one = {"taskid":self.taskid,"assetid":self.assetid,"url":newurl,"path":filename,"reqcode":res.status_code,"banner":base64.b64encode(char_convert(content[0:100])),"reslength":len(content),"status":1}
+                        content = res.content[0:100] if not get_banner_by_content(res) else "["+get_banner_by_content(res)+"] ==" + res.content[0:100]
+                        content = content.replace("\n","").replace("\r","")
+                        rs_one = {"taskid":taskid,"assetid":assetid,"url":newurl,"path":filename,"reqcode":res.status_code,"banner":cgi.escape(base64.b64encode(char_convert(content))),"reslength":len(res.content),"status":1}
                         self.fuzzdb.insert('fuzztask', rs_one, filter=False)
                         mu.release()
         except:
             pass
 
     def result_unique(self):
-        sql = "select * from (select *,count(reslength) as flag from fuzztask where taskid={0} group by reslength) where flag=1".format(self.taskid,self.assetid)
+        sql = "select * from (select *,count(reslength) as flag from fuzztask where taskid={0} group by reslength)".format(self.taskid)
         rs = self.fuzzdb.queryall(sql)
         sql_1 = "delete from fuzztask"
         sql_2 = "update sqlite_sequence SET seq = 0 where name ='fuzztask'"
@@ -110,17 +111,20 @@ class DirFuzz(object):
             if not self.single:
                 rs = self.assetdb.query_all("select * from asset")
                 for id, taskid,ip, port, domain, banner, protocol, service, assettype, position, schema in rs:
+                    if self.taskid is None:
+                        self.taskid = taskid
                     web_banner, web_service, ostype, assettype, domain, position, proext = HttpWeb.detect(ip, port,self.httpclient)
                     if proext:
                         url = "{schema}://{ip}:{port}".format(schema=proext,ip=ip,port=port)
-                        rs = self.cache_content(url)
+                        rs = self.cache_content(taskid,id,url)
                         if rs:
                             for x in self.filename:
-                                tp.add_task(self.req_ad_file,url,x,rs)
+                                tp.add_task(self.req_ad_file,taskid,id,url,x,rs)
             else:
-                rs = self.cache_content(self.url)
+                self.taskid = -100
+                rs = self.cache_content(self.taskid,-100,self.url)
                 for x in self.filename:
-                    tp.add_task(self.req_ad_file, self.url, x, rs)
+                    tp.add_task(self.req_ad_file, self.taskid,-100,self.url, x, rs)
         else:
             task_null_count = 0
             while not self.finished:
@@ -132,14 +136,13 @@ class DirFuzz(object):
                 if not msgqueue.empty():
                     rs_one = msgqueue.get(True)
                     self.taskid = rs_one.get("taskid")
-                    self.assetid = rs_one.get("assetid")
                     web_banner, web_service, ostype, assettype, domain, position, proext = HttpWeb.detect(rs_one.get("ip"), rs_one.get("port"),self.httpclient)
                     if proext:
                         url = "{schema}://{ip}:{port}".format(schema=proext, ip=rs_one.get("ip"), port=rs_one.get("port"))
-                        rs = self.cache_content(url)
+                        rs = self.cache_content(self.taskid,rs_one.get("assetid"),url)
                         if rs:
                             for x in self.filename:
-                                tp.add_task(self.req_ad_file, url, x, rs)
+                                tp.add_task(self.req_ad_file,self.taskid,rs_one.get("assetid"), url, x, rs)
                 else:
                     if TaskCenter.task_is_finished(self.statusqueue,"portscan"):
                         task_null_count = task_null_count+1
@@ -150,8 +153,6 @@ class DirFuzz(object):
 
 if __name__ == "__main__":
     optparser = OptionParser()
-    optparser.add_option("-t", "--taskid", dest="taskid", type="int", default=-100, help="task's id")
-    optparser.add_option("-a", "--assetid", dest="assetid", type="int", default=-100, help="asset's id")
     optparser.add_option("-d", "--dbname", dest="dbname", type="string", default="", help="port scan result's db")
     optparser.add_option("-u", "--url", dest="url", type="string", default="", help="url cues")
     try:
